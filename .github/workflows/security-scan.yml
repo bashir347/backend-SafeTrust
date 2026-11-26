@@ -1,0 +1,50 @@
+name: Docker / config security scan
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.test"
+      - "webhook/Dockerfile"
+      - "docker-compose.yml"
+      - "docker-compose-test.yml"
+      - ".dockerignore"
+      - ".github/workflows/security-scan.yml"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build webhook image
+        run: |
+          docker build \
+            --pull \
+            --tag safetrust-webhook:scan \
+            --file webhook/Dockerfile \
+            .
+
+      - name: Scan built webhook image
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          scan-type: image
+          image-ref: safetrust-webhook:scan
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+          vuln-type: "os,library"
+          scanners: "vuln"
+
+      - name: Scan Compose / Dockerfile configuration
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"

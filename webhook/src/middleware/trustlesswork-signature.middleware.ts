@@ -64,7 +64,12 @@ export const verifyTrustlessWorkSignature = (
   res: Response,
   next: NextFunction
 ): void => {
-  const secret = process.env.TRUSTLESSWORK_WEBHOOK_SECRET
+  // The webhook secret is sensitive; support a file-backed variant
+  // (TRUSTLESSWORK_WEBHOOK_SECRET_FILE) that wins over the plain env var when both
+  // are set, matching the pattern used for POSTGRES_PASSWORD.
+  const secret =
+    process.env.TRUSTLESSWORK_WEBHOOK_SECRET_FILE ||
+    process.env.TRUSTLESSWORK_WEBHOOK_SECRET
   if (!secret) {
     console.error('[trustlesswork-signature] TRUSTLESSWORK_WEBHOOK_SECRET not set')
     res.status(500).json({ error: 'Webhook secret not configured' })

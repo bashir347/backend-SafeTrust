@@ -1,34 +1,63 @@
 services:
   postgres_test:
-    image: postgis/postgis:15-3.3
+    image: postgis/postgis:15-3.3@sha256:a2fc46b52819d25add4ed93d3da83e106e17ea3ace6883cce3791631c9820bb2 # 15-3.3
     restart: always
     volumes:
       - db_data_test:/var/lib/postgresql/data
     environment:
       POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:-postgrespassword}
+    # Tests run on a developer machine; bind Postgres to loopback so the superuser
+    # port is not exposed on the host network. Local tooling can still reach it via
+    # 127.0.0.1:${TEST_POSTGRES_PORT:-5434}.
     ports:
-      - "${TEST_POSTGRES_PORT:-5434}:5432"
+      - "127.0.0.1:${TEST_POSTGRES_PORT:-5434}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 200
     networks:
       - test-network
 
+  x-admin-db-url-test: &admin-db-url-test
+    postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
+
   graphql-engine-test:
-    image: hasura/graphql-engine:v2.47.0
+    image: hasura/graphql-engine:v2.47.0@sha256:ceefc35c505b3c6201c89549f383d69bfae15f6124895b2e6f712b66f5612677 # v2.47.0
+    # Bind to loopback in test so the console and engine are not exposed on the
+    # host network. The Karate suite reaches Hasura through docker networking.
     ports:
-      - "${TEST_HASURA_PORT:-8081}:8080"
+      - "127.0.0.1:${TEST_HASURA_PORT:-8081}:8080"
     restart: always
     environment:
-      # NOTE: TEST_POSTGRES_PASSWORD must be URI-safe (no @, /, :, ?) — see .env.test.example
-      HASURA_GRAPHQL_METADATA_DATABASE_URL: postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
-      PG_DATABASE_URL: postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
+      HASURA_GRAPHQL_METADATA_DATABASE_URL: >-
+        postgres://hasura_metadata:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/hasura_metadata
+      PG_DATABASE_URL: >-
+        postgres://hasura:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
       HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
       HASURA_GRAPHQL_DEV_MODE: "true"
-      HASURA_GRAPHQL_ENABLED_LOG_TYPES: startup, http-log, webhook-log, websocket-log, query-log
+      HASURA_GRAPHQL_ENABLED_LOG_TYPES: >-
+        startup, http-log, webhook-log, websocket-log
       HASURA_GRAPHQL_ADMIN_SECRET: ${TEST_ADMIN_SECRET:-myadminsecretkey}
     depends_on:
       postgres_test:
@@ -39,6 +68,18 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 200
     networks:
       - test-network
 
@@ -51,21 +92,36 @@ services:
       - .:/app
     environment:
       HASURA_GRAPHQL_ENDPOINT: http://graphql-engine-test:8080
-      PG_DATABASE_URL: postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
+      PG_DATABASE_URL: >-
+        postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
       HASURA_GRAPHQL_ADMIN_SECRET: ${TEST_ADMIN_SECRET:-myadminsecretkey}
       CONSOLE_PORT: 9696
     working_dir: /app
+    # The Hasura console is used locally during test setup. Bind it to loopback so
+    # it is not exposed on the host network.
     ports:
-      - "9696:9696"
+      - "127.0.0.1:9696:9696"
     depends_on:
       graphql-engine-test:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 200
     networks:
       - test-network
 
   webhook:
     ports:
-      - "${TEST_WEBHOOK_PORT:-3001}:3001"
+      - "127.0.0.1:${TEST_WEBHOOK_PORT:-3001}:3001"
     build:
       context: .
       dockerfile: webhook/Dockerfile
@@ -76,12 +132,13 @@ services:
     environment:
       - NODE_ENV=test
       - WEBHOOK_PORT=3001
+      - PORT=3001
       - HASURA_GRAPHQL_ADMIN_SECRET=${TEST_ADMIN_SECRET:-myadminsecretkey}
       - HASURA_GRAPHQL_ENDPOINT=http://graphql-engine-test:8080/v1/graphql
       - POSTGRES_HOST=postgres_test
       - POSTGRES_PORT=5432
       - POSTGRES_DB=postgres
-      - POSTGRES_USER=postgres
+      - POSTGRES_USER=webhook
       - POSTGRES_PASSWORD=${TEST_POSTGRES_PASSWORD:-postgrespassword}
       - USE_MOCK_DATA=true
       - TRUSTLESSWORK_WEBHOOK_SECRET=${TEST_WEBHOOK_SECRET:-dev-secret}
@@ -93,14 +150,29 @@ services:
       postgres_test:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/webhook/dist
+    mem_limit: 256m
+    cpus: "0.5"
+    pids_limit: 100
     networks:
       - test-network
-
 
   karate:
     build:
@@ -130,6 +202,18 @@ services:
         condition: service_completed_successfully
       graphql-engine-test:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 200
     networks:
       - test-network
 
@@ -140,11 +224,25 @@ services:
     environment:
       HASURA_GRAPHQL_ENDPOINT: http://graphql-engine-test:8080
       HASURA_GRAPHQL_ADMIN_SECRET: ${TEST_ADMIN_SECRET:-myadminsecretkey}
+      PG_DATABASE_URL: >-
+        postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
     working_dir: /app
     command: ["bash", "bin/prepare-test-db"]
     depends_on:
       graphql-engine-test:
         condition: service_started
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 200
     networks:
       - test-network
 

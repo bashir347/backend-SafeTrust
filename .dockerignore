@@ -1,9 +1,32 @@
 .git
+
+# Environment and secrets — keep .env.example as the documented template.
 .env
+.env.local
+.env.*.local
+.env.*
+!.env.example
+**/*.pem
+**/*service-account*.json
+**/service-account*.json
+
+# Dependencies and build artifacts
 **/node_modules
 **/target
 **/dist
 tests/results
 *.node
-.env.test
+coverage
+.nyc_output
+lcov.info
+
+# Cross-platform build cache
 .docker-cache
+
+# Docs and GitHub tooling are not needed inside the build context.
+docs/
+.github/
+
+# Misc
+.DS_Store
+*.log

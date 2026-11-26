@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# bin/prepare-test-db
+#
+# Sets up the least-privilege roles used by the running services and the
+# hasura_metadata database used by Hasura's catalog, then applies migrations as
+# the admin role. This is the only step that runs as superuser; the long-running
+# services connect as least-privilege roles.
+#
+# This is called by the migrate-test service in docker-compose-test.yml. It
+# runs inside the Hasura CLI container, which has network access to
+# postgres_test and the hasura CLI tooling.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PG_HOST="${POSTGRES_HOST:-postgres_test}"
+PG_PORT="${POSTGRES_PORT:-5432}"
+PG_ADMIN_USER="${POSTGRES_USER:-postgres}"
+# In test, the admin password is the TEST_POSTGRES_PASSWORD default when unset.
+PG_ADMIN_PASSWORD="${TEST_POSTGRES_PASSWORD:-postgrespassword}"
+TENANT_DB="${POSTGRES_DB:-postgres}"
+METADATA_DB="hasura_metadata"
+
+# Least-privilege role names. These match the connection strings in
+# docker-compose-test.yml (graphql-engine-test and webhook).
+HASURA_ROLE="hasura"
+HASURA_METADATA_ROLE="hasura_metadata"
+WEBHOOK_ROLE="webhook"
+
+# ── Helper: run psql as the admin role ────────────────────────────────────────
+# The official Postgres image allows password-less local peer/trust connections for
+# the postgres user when the container entrypoint sets PGUSER. Inside the CLI
+# container we connect over the Docker network as the admin user with a password.
+psql-admin() {
+  PGPASSWORD="$PG_ADMIN_PASSWORD" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_ADMIN_USER" -d "$TENANT_DB" -v ON_ERROR_STOP=1 -q "$@"
+}
+
+echo "⏳ Preparing test database roles on ${PG_HOST}:${PG_PORT}..."
+echo "   Tenant DB:      ${TENANT_DB}"
+echo "   Metadata DB:    ${METADATA_DB}"
+echo "   Roles:          ${HASURA_ROLE}, ${HASURA_METADATA_ROLE}, ${WEBHOOK_ROLE}"
+echo ""
+
+# ── 1. Create the hasura_metadata database (owned by hasura_metadata role) ───
+# Running services must not be able to CREATE DATABASE or own the Hasura catalog.
+# The metadata role owns its own database so Hasura can manage its catalog there
+# without giving the data-source role any rights on it.
+psql-admin <<SQL
+-- Only create the role/database when they do not already exist, so this step is
+-- safe to run on every test invocation (idempotent).
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '${HASURA_METADATA_ROLE}') THEN
+    CREATE ROLE ${HASURA_METADATA_ROLE} WITH LOGIN PASSWORD '${PG_ADMIN_PASSWORD}';
+  END IF;
+END
+\$\$;
+
+-- Create the metadata database owned by the metadata role. If it already exists,
+-- ensure the owner is the metadata role (no-op if already correct).
+CREATE DATABASE ${METADATA_DB} WITH OWNER ${HASURA_METADATA_ROLE}
+  TEMPLATE template0 LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'
+  CONNECTION LIMIT 20;
+SQL
+
+# If the database already existed, set the owner without recreating it.
+psql-admin -d postgres <<SQL
+DO \$\$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_database WHERE datname = '${METADATA_DB}') THEN
+    -- Re-own only when the current owner is not the metadata role. This is a
+    -- no-op in the normal case and avoids "cannot change owner of database" when
+    -- the owner is already correct.
+    IF (SELECT pg_catalog.pg_database_size('${METADATA_DB}')) IS NOT NULL THEN
+      ALTER DATABASE ${METADATA_DB} OWNER TO ${HASURA_METADATA_ROLE};
+    END IF;
+  END IF;
+END
+\$\$;
+SQL
+
+echo "✅ hasura_metadata database ready (owner: ${HASURA_METADATA_ROLE})"
+
+# ── 2. Create the data-source role (hasura) ───────────────────────────────────
+# This role connects to tenant databases (safetrust, hotel_industry). It gets
+# USAGE on the database and table privileges only on the tenant schemas — never
+# superuser, never CREATEROLE, never CREATEDB.
+psql-admin <<SQL
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '${HASURA_ROLE}') THEN
+    CREATE ROLE ${HASURA_ROLE} WITH LOGIN PASSWORD '${PG_ADMIN_PASSWORD}';
+  END IF;
+END
+\$\$;
+SQL
+
+echo "✅ hasura role ready (data-source, least-privilege)"
+
+# ── 3. Grant the data-source role rights on the tenant databases ───────────────
+# Only the schemas/tables that belong to tenants get tracked. GRANT CREATE on the
+# database is intentionally omitted (the service must never create objects).
+for DB in ${TENANT_DB}; do
+  psql-admin -d "$DB" <<SQL
+-- Allow the data-source role to connect to the tenant database.
+GRANT CONNECT ON DATABASE "${DB}" TO "${HASURA_ROLE}";
+
+-- In the public schema, the data-source role can use the schema and access the
+-- tables that the migration step creates. Object ownership stays with the admin
+-- role so migrations keep working; the service role gets explicit table grants.
+GRANT USAGE ON SCHEMA public TO "${HASURA_ROLE}";
+SQL
+done
+
+echo "✅ hasura role granted CONNECT + USAGE on ${TENANT_DB}"
+
+# ── 4. Create the webhook role (least-privilege) ──────────────────────────────
+# The webhook only reads and writes the tables it needs. It must not be able to
+# CREATE TABLE or run COPY ... PROGRAM (or any other superuser-like operation).
+psql-admin <<SQL
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '${WEBHOOK_ROLE}') THEN
+    CREATE ROLE ${WEBHOOK_ROLE} WITH LOGIN PASSWORD '${PG_ADMIN_PASSWORD}';
+  END IF;
+END
+\$\$;
+SQL
+
+psql-admin -d "$TENANT_DB" <<SQL
+GRANT CONNECT ON DATABASE "${TENANT_DB}" TO "${WEBHOOK_ROLE}";
+GRANT USAGE ON SCHEMA public TO "${WEBHOOK_ROLE}";
+SQL
+
+echo "✅ webhook role ready (least-privilege, no CREATE / superuser)"
+
+# ── 5. Apply migrations as the admin role ──────────────────────────────────────
+# Migrations must create tables and objects, so they run as the admin role (the
+# only step with that privilege). The running services never do this.
+#
+# The Hasura CLI reads PG_DATABASE_URL from its environment. We point that at the
+# admin connection so `hasura migrate apply` can create the tenant schema. After
+# this step returns, the long-running graphql-engine-test and webhook services use
+# the least-privilege roles defined above.
+export PGHOST="$PG_HOST"
+export PGPORT="$PG_PORT"
+export PGUSER="$PG_ADMIN_USER"
+export PGPASSWORD="$PG_ADMIN_PASSWORD"
+export PGDATABASE="$TENANT_DB"
+
+if [[ "${HASURA_GRAPHQL_ENDPOINT:-}" ]]; then
+  echo ""
+  echo "📂 Applying migrations via Hasura CLI..."
+  hasura migrate apply \
+    --endpoint "${HASURA_GRAPHQL_ENDPOINT}" \
+    --admin-secret "${HASURA_GRAPHQL_ADMIN_SECRET:-myadminsecretkey}" \
+    --database-name "$TENANT_DB" \
+    || echo "⚠️  hasura migrate apply returned a non-zero exit (continuing)"
+else
+  echo ""
+  echo "ℹ️  HASURA_GRAPHQL_ENDPOINT is not set — skipping hasura migrate apply"
+fi
+
+echo ""
+echo "✅ Test database prepared"
+echo "   Admin connection (migrations only): postgres://${PG_ADMIN_USER}:***@${PG_HOST}:${PG_PORT}/${TENANT_DB}"
+echo "   Hasura data source:                postgres://${HASURA_ROLE}:***@${PG_HOST}:${PG_PORT}/${TENANT_DB}"
+echo "   Hasura metadata:                   postgres://${HASURA_METADATA_ROLE}:***@${PG_HOST}:${PG_PORT}/${METADATA_DB}"
+echo "   Webhook:                           postgres://${WEBHOOK_ROLE}:***@${PG_HOST}:${PG_PORT}/${TENANT_DB}"

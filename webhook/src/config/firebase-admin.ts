@@ -18,7 +18,14 @@ export function initializeFirebaseAdmin(): void {
 
   const projectId = process.env.FIREBASE_PROJECT_ID
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL
-  const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
+  // Firebase private key is a sensitive value; support a file-backed variant
+  // (FIREBASE_PRIVATE_KEY_FILE) that wins over FIREBASE_PRIVATE_KEY when both are set.
+  const rawPrivateKey = requireSecret(
+    'FIREBASE_PRIVATE_KEY_FILE',
+    'FIREBASE_PRIVATE_KEY',
+    'FIREBASE_PRIVATE_KEY',
+  )
+  const privateKey = rawPrivateKey?.replace(/\\n/g, '\n')
 
   if (!projectId || !clientEmail || !privateKey) {
     const msg =

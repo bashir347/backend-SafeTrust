@@ -17,11 +17,34 @@ if [ -f .env ]; then
   unset COMPOSE_ENV ENV_ENTRY
 fi
 
-HASURA_ADMIN_SECRET="${HASURA_GRAPHQL_ADMIN_SECRET:-myadminsecretkey}"
+HASURA_ADMIN_SECRET="${HASURA_GRAPHQL_ADMIN_SECRET:?Hasura admin secret must be set (HASURA_GRAPHQL_ADMIN_SECRET)}"
 HASURA_PORT="${HASURA_PORT:-8080}"
 POSTGRES_PORT="${POSTGRES_PORT:-5433}"
 WEBHOOK_PORT="${WEBHOOK_PORT:-3000}"
 HASURA_ENDPOINT="http://localhost:${HASURA_PORT}"
+
+# Database roles (least-privilege for running services; admin only for migrations).
+# These must match the connection strings in docker-compose.yml.
+PG_ADMIN_USER="${POSTGRES_USER:-postgres}"
+PG_HASURA_ROLE="${PG_HASURA_ROLE:-hasura}"
+PG_HASURA_METADATA_ROLE="${PG_HASURA_METADATA_ROLE:-hasura_metadata}"
+PG_WEBHOOK_ROLE="${PG_WEBHOOK_ROLE:-webhook}"
+PG_METADATA_DB="${PG_METADATA_DB:-hasura_metadata}"
+
+# Admin connection for the migration / metadata / seed steps. The long-running
+# services (Hasura data source, webhook) use least-privilege roles instead.
+export PGUSER="$PG_ADMIN_USER"
+export PGPASSWORD="${POSTGRES_PASSWORD:?Postgres password must be set (POSTGRES_PASSWORD)}"
+export PGDATABASE="${POSTGRES_DB:-postgres}"
+export PGHOST="postgres"
+export PGPORT="5432"
+# Database roles (least-privilege for running services; admin only for migrations).
+# These must match the connection strings in docker-compose.yml.
+PG_ADMIN_USER="${POSTGRES_USER:-postgres}"
+PG_HASURA_ROLE="${PG_HASURA_ROLE:-hasura}"
+PG_HASURA_METADATA_ROLE="${PG_HASURA_METADATA_ROLE:-hasura_metadata}"
+PG_WEBHOOK_ROLE="${PG_WEBHOOK_ROLE:-webhook}"
+PG_METADATA_DB="${PG_METADATA_DB:-hasura_metadata}"
 
 RESET_DATABASE=false
 RESTART_CONTAINERS=false
@@ -304,8 +327,16 @@ echo ""
 echo "✅ SafeTrust backend ready"
 echo "   Tenants deployed: ${TENANTS[*]}"
 echo "   GraphQL:          ${HASURA_ENDPOINT}/v1/graphql"
-echo "   PostgreSQL:       localhost:${POSTGRES_PORT}"
+echo "   PostgreSQL:       localhost:${POSTGRES_PORT} (admin only — not published on the host)"
 echo "   Webhook:          http://localhost:${WEBHOOK_PORT}"
+echo ""
+echo "👉 Database roles (least-privilege):"
+echo "   Admin (migrations/metadata/seeds only): postgres://${PG_ADMIN_USER}:***@postgres:5432/${PGDATABASE}"
+echo "   Hasura data source:                     postgres://${PG_HASURA_ROLE}:***@postgres:5432/${PGDATABASE}"
+echo "   Hasura metadata:                        postgres://${PG_HASURA_METADATA_ROLE}:***@postgres:5432/${PG_METADATA_DB}"
+echo "   Webhook:                                postgres://${PG_WEBHOOK_ROLE}:***@postgres:5432/${PGDATABASE}"
 echo ""
 echo "👉 To open Hasura console:"
 echo "   hasura console --endpoint ${HASURA_ENDPOINT} --admin-secret $HASURA_ADMIN_SECRET"
+echo "   (Console port is not published on the host — use docker compose port or the""
+echo "    docker-compose.override.yml example in docs/infra/bin-start.md.)"

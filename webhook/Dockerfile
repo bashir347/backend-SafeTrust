@@ -1,12 +1,16 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM node:24-bookworm-slim AS builder
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS builder # 24-bookworm-slim
 
 # Rust toolchain for the Neon addons (webhook-verifier, zk-verifier,
-# stellar-utils, chunk-processor, pg-bulk-upsert, x402-processor), plus a glibc
-# runtime for the pinned Barretenberg binary.
+# stellar-utils, chunk-processor, pg-bulk-upsert, x402-processor, soroban-reconciler,
+# escrow-state-machine), plus a glibc runtime for the pinned Barretenberg binary.
+#
+# Install with --no-install-recommends and clean the apt cache so the builder layer
+# does not keep recommended packages or the package index.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl \
+    build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -21,6 +25,8 @@ RUN cd webhook && npm ci
 #    `cargo build --workspace --manifest-path ../crates/Cargo.toml` resolves from webhook.
 COPY crates/ ./crates/
 COPY tsconfig.crates.json ./
+COPY Cargo.lock ./
+COPY Cargo.toml ./
 
 # 3. TypeScript sources + config.
 COPY webhook/tsconfig.json ./webhook/
@@ -31,11 +37,14 @@ COPY webhook/src/ ./webhook/src/
 RUN cd webhook && npm run build
 
 # ── Stage 2: Production ───────────────────────────────────────────────────────
-FROM node:24-bookworm-slim AS production
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS production # 24-bookworm-slim
 
 WORKDIR /app/webhook
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+# No need for curl in the runtime image: the health check uses the Node runtime that
+# is already present, and the webhook never calls out with curl. Keep the image small
+# and reduce the attacker surface by installing only ca-certificates.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY webhook/package*.json ./
@@ -73,12 +82,15 @@ COPY --from=builder /app/crates/escrow-state-machine/index.node /app/crates/escr
 COPY --from=builder /app/crates/escrow-state-machine/package.json /app/crates/escrow-state-machine/package.json
 COPY --from=builder /app/crates/escrow-state-machine/index.d.ts /app/crates/escrow-state-machine/index.d.ts
 
-# node user/group already exists in the official Node image.
+# Use the non-root node user shipped in the official Node image.
 USER node
 
-EXPOSE 3001
+# Match the service port used in Compose (3000 by default), not 3001.
+EXPOSE 3000
 
+# The health check uses the Node runtime, not curl, and reads the service port from
+# the PORT env so the image's own health check is correct outside Compose too.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3001/health || exit 1
+  CMD node -e "fetch('http://localhost:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "dist/index.js"]
