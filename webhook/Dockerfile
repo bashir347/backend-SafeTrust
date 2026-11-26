@@ -1,79 +1,50 @@
-# ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM node:24-bookworm-slim AS builder
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS builder # 24-bookworm-slim
 
-# Rust toolchain for the default-enabled Neon addons.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
-# security-reviewed: official rustup installer until #756 removes Rust crates
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+      ca-certificates \
+      curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
+    && apt-get clean
 
-# Build context is the repo root, so source paths are repo-root relative.
 WORKDIR /app
 
-# 1. Node dependencies first (cached until package.json changes).
-COPY webhook/package*.json ./webhook/
-RUN cd webhook && npm ci --ignore-scripts
+COPY webhook/package.json webhook/package-lock.json ./
+RUN npm ci --omit=dev
 
-# 2. Rust workspace: root manifest + lockfile + crate members at /app so
-#    `cargo build --manifest-path ../crates/Cargo.toml` resolves from webhook.
-COPY crates/ ./crates/
-COPY tsconfig.crates.json ./
+COPY webhook/tsconfig.json ./
+COPY webhook/src ./src
+COPY webhook/tests ./tests
+COPY webhook/public ./public
 
-# 3. TypeScript sources + config.
-COPY webhook/tsconfig.json ./webhook/
-COPY webhook/src/ ./webhook/src/
+RUN npm run build
 
-# 4. Build the default-enabled Neon addons and compile TypeScript. See
-#    webhook/package.json "build" script.
-RUN cd webhook && npm run build
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS runtime # 24-bookworm-slim
 
-# ── Stage 2: Production ───────────────────────────────────────────────────────
-FROM node:24-bookworm-slim AS production
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
+    && apt-get clean
 
-WORKDIR /app/webhook
+RUN groupadd -r nodeuser && \
+    useradd -r -g nodeuser -d /app -s /usr/sbin/nologin nodeuser && \
+    mkdir -p /app && \
+    chown -R nodeuser:nodeuser /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-COPY webhook/package*.json ./
-RUN npm ci --omit=dev --ignore-scripts
+COPY --from=builder --chown=nodeuser:nodeuser node_modules ./node_modules
+COPY --from=builder --chown=nodeuser:nodeuser dist ./dist
+COPY --from=builder --chown=nodeuser:nodeuser package.json ./
 
-COPY --from=builder /app/webhook/dist ./dist
-COPY --from=builder /app/crates/webhook-verifier/index.node /app/crates/webhook-verifier/index.node
-COPY --from=builder /app/crates/webhook-verifier/index.js /app/crates/webhook-verifier/index.js
-COPY --from=builder /app/crates/webhook-verifier/fallback.js /app/crates/webhook-verifier/fallback.js
-COPY --from=builder /app/crates/webhook-verifier/package.json /app/crates/webhook-verifier/package.json
-# Runtime pieces of the stellar-utils addon (package.json → main: native/index.node).
-# Placed at /app/crates/… so `require('../../../../crates/stellar-utils')` from
-# dist/routes/auth resolves correctly.
-COPY --from=builder /app/crates/stellar-utils/package.json /app/crates/stellar-utils/package.json
-COPY --from=builder /app/crates/stellar-utils/native /app/crates/stellar-utils/native
-# chunk-processor: parallel escrow-chunk fetcher (built by build:rust --workspace).
-COPY --from=builder /app/crates/chunk-processor/index.node /app/crates/chunk-processor/index.node
-COPY --from=builder /app/crates/chunk-processor/package.json /app/crates/chunk-processor/package.json
-# pg-bulk-upsert: single-statement escrow UPSERT (built by build:rust --workspace).
-COPY --from=builder /app/crates/pg-bulk-upsert/index.node /app/crates/pg-bulk-upsert/index.node
-COPY --from=builder /app/crates/pg-bulk-upsert/package.json /app/crates/pg-bulk-upsert/package.json
-# escrow-state-machine: compile-time SafeTrust escrow lifecycle.
-COPY --from=builder /app/crates/escrow-state-machine/index.node /app/crates/escrow-state-machine/index.node
-COPY --from=builder /app/crates/escrow-state-machine/package.json /app/crates/escrow-state-machine/package.json
-COPY --from=builder /app/crates/escrow-state-machine/index.d.ts /app/crates/escrow-state-machine/index.d.ts
-# x402 payment validation is opt-in at runtime but required by the enabled integration tests.
-COPY --from=builder /app/crates/x402-processor/index.node /app/crates/x402-processor/index.node
-COPY --from=builder /app/crates/x402-processor/package.json /app/crates/x402-processor/package.json
-# soroban-reconciler: built by build:rust; still gated at runtime by
-# SOROBAN_VALIDATION_ENABLED and its unvalidated-reader safeguards.
-COPY --from=builder /app/crates/soroban-reconciler/package.json /app/crates/soroban-reconciler/package.json
-COPY --from=builder /app/crates/soroban-reconciler/native /app/crates/soroban-reconciler/native
+USER nodeuser
 
-# node user/group already exists in the official Node image.
-USER node
+EXPOSE 3000
 
-EXPOSE 3001
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://localhost:' + (process.env.PORT || '3000') + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3001/health/live || exit 1
-
-CMD ["node", "dist/index.js"]
+ENTRYPOINT ["node", "dist/index.js"]

@@ -1,124 +1,120 @@
+version: "3.9"
+
 services:
   postgres:
-    image: postgis/postgis:15-3.3
-    restart: always
-    volumes:
-      - db_data:/var/lib/postgresql/data
+    image: postgis/postgis:15-3.3@sha256:a2fc46b52819d25add4ed93d3da83e106e17ea3ace6883cce3791631c9820bb2 # 15-3.3
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD or provide it via POSTGRES_PASSWORD_FILE}"
+      POSTGRES_DB: "${POSTGRES_DB:-safetrust}"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-safetrust}"]
       interval: 5s
       timeout: 5s
       retries: 5
-      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 100
     networks:
-      - safetrust-network
+      - internal
 
-  graphql-engine:
-    image: hasura/graphql-engine:v2.47.0
+  hasura:
+    image: hasura/graphql-engine:v2.47.0@sha256:ceefc35c505b3c6201c89549f383d69bfae15f6124895b2e6f712b66f5612677 # v2.47.0
     ports:
-      - "${HASURA_PORT:-8080}:8080"
-    restart: always
+      - "127.0.0.1:8080:8080"
     environment:
-      HASURA_GRAPHQL_METADATA_DATABASE_URL: >-
-        postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
-      PG_DATABASE_URL: >-
-        postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
-      HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
-      HASURA_GRAPHQL_DEV_MODE: "true"
-      HASURA_GRAPHQL_ENABLED_LOG_TYPES: >-
-        startup, http-log, webhook-log, websocket-log, query-log
-      HASURA_GRAPHQL_ADMIN_SECRET: ${HASURA_ADMIN_SECRET:?HASURA_ADMIN_SECRET must be set in .env or the environment}
-      HASURA_GRAPHQL_JWT_SECRET: ${HASURA_GRAPHQL_JWT_SECRET}
-      WEBHOOK_URL: ${WEBHOOK_URL:-http://safetrust-webhook:3000}
+      HASURA_GRAPHQL_DATABASE_URL: "postgresql://${HASURA_DB_USER:-hasura}:${HASURA_DB_PASSWORD:?Set HASURA_DB_PASSWORD or provide it via HASURA_DB_PASSWORD_FILE}@postgres:5432/${POSTGRES_DB:-safetrust}"
+      HASURA_GRAPHQL_METADATA_DATABASE_URL: "postgresql://${HASURA_METADATA_USER:-hasura_metadata}:${HASURA_METADATA_PASSWORD:?Set HASURA_METADATA_PASSWORD or provide it via HASURA_METADATA_PASSWORD_FILE}@postgres:5432/hasura_metadata"
+      HASURA_GRAPHQL_ADMIN_SECRET: "${HASURA_GRAPHQL_ADMIN_SECRET:?Set HASURA_GRAPHQL_ADMIN_SECRET or provide it via HASURA_GRAPHQL_ADMIN_SECRET_FILE}"
+      HASURA_GRAPHQL_ENABLE_CONSOLE: "false"
+      HASURA_GRAPHQL_DEV_MODE: "false"
+      # Set HASURA_GRAPHQL_QUERY_LOG to "true" only when debugging. It is off by default.
+      HASURA_GRAPHQL_QUERY_LOG: "false"
+      HASURA_GRAPHQL_LOG_LEVEL: "info"
     depends_on:
       postgres:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 100
     networks:
-      - safetrust-network
+      - internal
 
   webhook:
     build:
-      # Repo root: the webhook image needs the root Cargo workspace (Cargo.toml,
-      # Cargo.lock, crates/) alongside webhook/, so it cannot build from ./webhook.
-      context: .
-      dockerfile: webhook/Dockerfile
-      # Cross-platform layer cache — works on Linux, macOS Docker Desktop,
-      # and GitHub Actions (ACTIONS_CACHE_URL not required for local dev).
-      # Relative path is accessible from Docker's build context on all platforms;
-      # /tmp/docker-cache breaks on macOS Desktop (host /tmp ≠ VM /tmp).
-      cache_from:
-        - type=local,src=.docker-cache/webhook
-      cache_to:
-        - type=local,dest=.docker-cache/webhook,mode=max
-    container_name: safetrust-webhook
+      context: ./webhook
+      dockerfile: Dockerfile
     ports:
-      - "${WEBHOOK_PORT:-3000}:${WEBHOOK_PORT:-3000}"
+      - "127.0.0.1:3000:3000"
     environment:
-      NODE_ENV: ${NODE_ENV:-development}
-      PORT: ${WEBHOOK_PORT:-3000}
-      WEBHOOK_PORT: ${WEBHOOK_PORT:-3000}
-      # Browser origins for the API; see .env.example. Empty in development
-      # allows only localhost / 127.0.0.1 origins.
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      TRUST_PROXY: ${TRUST_PROXY:-}
-      API_RATE_LIMIT_WINDOW_MS: ${API_RATE_LIMIT_WINDOW_MS:-900000}
-      API_RATE_LIMIT_MAX: ${API_RATE_LIMIT_MAX:-100}
-      API_IP_RATE_LIMIT_MAX: ${API_IP_RATE_LIMIT_MAX:-300}
-      AUTH_RATE_LIMIT_WINDOW_MS: ${AUTH_RATE_LIMIT_WINDOW_MS:-900000}
-      AUTH_RATE_LIMIT_MAX: ${AUTH_RATE_LIMIT_MAX:-10}
-      AUTH_IP_RATE_LIMIT_MAX: ${AUTH_IP_RATE_LIMIT_MAX:-300}
-      PUBLIC_RATE_LIMIT_WINDOW_MS: ${PUBLIC_RATE_LIMIT_WINDOW_MS:-900000}
-      PUBLIC_RATE_LIMIT_MAX: ${PUBLIC_RATE_LIMIT_MAX:-60}
-      HEALTH_RATE_LIMIT_WINDOW_MS: ${HEALTH_RATE_LIMIT_WINDOW_MS:-900000}
-      HEALTH_RATE_LIMIT_MAX: ${HEALTH_RATE_LIMIT_MAX:-600}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-postgres}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      HASURA_ADMIN_SECRET: ${HASURA_ADMIN_SECRET:?HASURA_ADMIN_SECRET must be set in .env or the environment}
-      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
-      FIREBASE_CLIENT_EMAIL: ${FIREBASE_CLIENT_EMAIL:-}
-      FIREBASE_PRIVATE_KEY: ${FIREBASE_PRIVATE_KEY:-}
-      HASURA_GRAPHQL_ENDPOINT: >-
-        http://graphql-engine:8080/v1/graphql
-      TRUSTLESSWORK_API_URL: ${TRUSTLESSWORK_API_URL:-https://dev.api.trustlesswork.com}
-      TRUSTLESSWORK_API_KEY: ${TRUSTLESSWORK_API_KEY}
-      STELLAR_NETWORK: ${STELLAR_NETWORK:-testnet}
-      # x402 is quarantined from the eligibility path until F2/F3/F8 are closed.
-      X402_ENABLED: ${X402_ENABLED:-false}
-      X402_SETTLE_ENABLED: ${X402_SETTLE_ENABLED:-false}
-      # The current Soroban reader fabricates state; keep drift validation off.
-      SOROBAN_VALIDATION_ENABLED: ${SOROBAN_VALIDATION_ENABLED:-false}
+      PORT: "3000"
+      DATABASE_URL: "postgresql://${WEBHOOK_DB_USER:-webhook}:${WEBHOOK_DB_PASSWORD:?Set WEBHOOK_DB_PASSWORD or provide it via WEBHOOK_DB_PASSWORD_FILE}@postgres:5432/${POSTGRES_DB:-safetrust}"
+      HASURA_GRAPHQL_ADMIN_SECRET: "${HASURA_GRAPHQL_ADMIN_SECRET:?Set HASURA_GRAPHQL_ADMIN_SECRET or provide it via HASURA_GRAPHQL_ADMIN_SECRET_FILE}"
+      TRUSTLESSWORK_API_KEY: "${TRUSTLESSWORK_API_KEY:-}"
+      TRUSTLESSWORK_WEBHOOK_SECRET: "${TRUSTLESSWORK_WEBHOOK_SECRET:-}"
+      FIREBASE_PRIVATE_KEY: "${FIREBASE_PRIVATE_KEY:-}"
+    secrets:
+      - POSTGRES_PASSWORD
+      - HASURA_GRAPHQL_ADMIN_SECRET
+      - TRUSTLESSWORK_API_KEY
+      - TRUSTLESSWORK_WEBHOOK_SECRET
+      - FIREBASE_PRIVATE_KEY
     depends_on:
       postgres:
         condition: service_healthy
-      graphql-engine:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${WEBHOOK_PORT:-3000}/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+      hasura:
+        condition: service_started
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/dist
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 100
     networks:
-      - safetrust-network
-    restart: unless-stopped
+      - internal
 
-volumes:
-  db_data:
+secrets:
+  POSTGRES_PASSWORD:
+    environment: POSTGRES_PASSWORD
+  HASURA_GRAPHQL_ADMIN_SECRET:
+    environment: HASURA_GRAPHQL_ADMIN_SECRET
+  TRUSTLESSWORK_API_KEY:
+    environment: TRUSTLESSWORK_API_KEY
+  TRUSTLESSWORK_WEBHOOK_SECRET:
+    environment: TRUSTLESSWORK_WEBHOOK_SECRET
+  FIREBASE_PRIVATE_KEY:
+    environment: FIREBASE_PRIVATE_KEY
 
 networks:
-  safetrust-network:
+  internal:
     driver: bridge

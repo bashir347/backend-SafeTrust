@@ -1,31 +1,34 @@
-# syntax=docker/dockerfile:1
-# Compile Karate's TypeScript configuration to the JavaScript consumed by Graal.
-FROM node:24-bookworm-slim AS karate-config
-WORKDIR /app
-COPY webhook/package*.json ./webhook/
-RUN cd webhook && npm ci --ignore-scripts
-COPY tests/karate/ ./tests/karate/
-RUN cd webhook && npm run build:karate
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS node-base # 24-bookworm-slim
+FROM eclipse-temurin:17-jdk-jammy@sha256:acf46b4e646df812fd95c54669bc80d44acef68f0bde1dd420ea47897de0d637 AS jdk-base # 17-jdk-jammy
 
-FROM eclipse-temurin:17-jdk-jammy
+FROM node-base AS build
 
 WORKDIR /app
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
-# Copy test files
-COPY tests /app/tests
-COPY --from=karate-config /app/tests/karate/src/test/resources /app/tests/karate/src/test/resources
+COPY webhook/package.json webhook/package-lock.json ./
+RUN npm ci --omit=dev
 
-# Make sure karate-config.js is in the right place
-RUN mkdir -p /app/tests/karate/src/test/resources
-# Create directory for test results
-RUN mkdir -p /app/target/karate-reports
+COPY webhook/tsconfig.json ./
+COPY webhook/src ./src
+COPY webhook/tests ./tests
 
-# Download Karate jar
-ADD --checksum=sha256:de03685d4721adf1a4642e9401fc364d7a2bcd296a9ce6427b4827b941c821be https://github.com/karatelabs/karate/releases/download/v1.4.1/karate-1.4.1.jar /app/tests/karate.jar
+FROM jdk-base AS jdk
 
-# Download Postgres JDBC driver
-ADD --checksum=sha256:0c244ac7d02cf89d8e29852eace6595d75bc4d78581b85b2768460081646a57b https://jdbc.postgresql.org/download/postgresql-42.7.2.jar /app/tests/postgresql-jdbc.jar
+COPY --from=build /app/node_modules /app/node_modules
+COPY --from=build /app/package.json /app/package-lock.json /app/tsconfig.json ./
+COPY --from=build /app/src ./src
+COPY --from=build /app/tests ./tests
 
-# Set default command
-CMD ["java", "-cp", "/app/tests/karate.jar:/app/tests/postgresql-jdbc.jar:/app/tests/karate/src/test/resources", "com.intuit.karate.Main", "--configdir", "/app/tests/karate/src/test/resources", "/app/tests/karate/features"]
+RUN npm run build
+
+FROM node-base AS runtime
+
+WORKDIR /app
+
+COPY --from=jdk /app/node_modules ./node_modules
+COPY --from=jdk /app/package.json ./package-lock.json ./tsconfig.json ./
+COPY --from=jdk /app/dist ./dist
+
+EXPOSE 3000
+
+CMD ["node", "dist/index.js"]

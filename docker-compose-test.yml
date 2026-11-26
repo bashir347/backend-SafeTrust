@@ -1,161 +1,124 @@
+version: "3.9"
+
 services:
-  postgres_test:
-    image: postgis/postgis:15-3.3
-    restart: always
-    volumes:
-      - db_data_test:/var/lib/postgresql/data
+  postgres-test:
+    image: postgis/postgis:15-3.3@sha256:a2fc46b52819d25add4ed93d3da83e106e17ea3ace6883cce3791631c9820bb2 # 15-3.3
     environment:
-      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:-postgrespassword}
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD or provide it via POSTGRES_PASSWORD_FILE}"
+      POSTGRES_DB: "${POSTGRES_DB:-safetrust}"
     ports:
-      - "${TEST_POSTGRES_PORT:-5434}:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-safetrust}"]
       interval: 5s
       timeout: 5s
       retries: 5
-      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 100
     networks:
-      - test-network
+      - internal
 
-  graphql-engine-test:
-    image: hasura/graphql-engine:v2.47.0
+  hasura-test:
+    image: hasura/graphql-engine:v2.47.0@sha256:ceefc35c505b3c6201c89549f383d69bfae15f6124895b2e6f712b66f5612677 # v2.47.0
     ports:
-      - "${TEST_HASURA_PORT:-8081}:8080"
-    restart: always
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9696:9695"
     environment:
-      # NOTE: TEST_POSTGRES_PASSWORD must be URI-safe (no @, /, :, ?) — see .env.test.example
-      HASURA_GRAPHQL_METADATA_DATABASE_URL: postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
-      PG_DATABASE_URL: postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
+      HASURA_GRAPHQL_DATABASE_URL: "postgresql://${HASURA_DB_USER:-hasura}:${HASURA_DB_PASSWORD:?Set HASURA_DB_PASSWORD or provide it via HASURA_DB_PASSWORD_FILE}@postgres-test:5432/${POSTGRES_DB:-safetrust}"
+      HASURA_GRAPHQL_METADATA_DATABASE_URL: "postgresql://${HASURA_METADATA_USER:-hasura_metadata}:${HASURA_METADATA_PASSWORD:?Set HASURA_METADATA_PASSWORD or provide it via HASURA_METADATA_PASSWORD_FILE}@postgres-test:5432/hasura_metadata"
+      HASURA_GRAPHQL_ADMIN_SECRET: "${HASURA_GRAPHQL_ADMIN_SECRET:?Set HASURA_GRAPHQL_ADMIN_SECRET or provide it via HASURA_GRAPHQL_ADMIN_SECRET_FILE}"
       HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
       HASURA_GRAPHQL_DEV_MODE: "true"
-      HASURA_GRAPHQL_ENABLED_LOG_TYPES: startup, http-log, webhook-log, websocket-log, query-log
-      HASURA_GRAPHQL_ADMIN_SECRET: ${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
+      # Set HASURA_GRAPHQL_QUERY_LOG to "true" only when debugging. It is off by default.
+      HASURA_GRAPHQL_QUERY_LOG: "false"
+      HASURA_GRAPHQL_LOG_LEVEL: "info"
     depends_on:
-      postgres_test:
+      postgres-test:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 100
     networks:
-      - test-network
+      - internal
 
-  hasura-cli-test:
+  webhook-test:
     build:
-      context: .
+      context: ./webhook
       dockerfile: Dockerfile
-    tty: true
-    volumes:
-      - .:/app
-    environment:
-      HASURA_GRAPHQL_ENDPOINT: http://graphql-engine-test:8080
-      PG_DATABASE_URL: postgres://postgres:${TEST_POSTGRES_PASSWORD:-postgrespassword}@postgres_test:5432/postgres
-      HASURA_ADMIN_SECRET: ${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-      HASURA_GRAPHQL_ADMIN_SECRET: ${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-      CONSOLE_PORT: 9696
-    working_dir: /app
     ports:
-      - "9696:9696"
-    depends_on:
-      graphql-engine-test:
-        condition: service_healthy
-    networks:
-      - test-network
-
-  webhook:
-    ports:
-      - "${TEST_WEBHOOK_PORT:-3001}:3001"
-    build:
-      context: .
-      dockerfile: webhook/Dockerfile
-      cache_from:
-        - type=local,src=.docker-cache/webhook
-      cache_to:
-        - type=local,dest=.docker-cache/webhook,mode=max
+      - "127.0.0.1:3000:3000"
     environment:
-      - NODE_ENV=test
-      - WEBHOOK_PORT=3001
-      - HASURA_ADMIN_SECRET=${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-      - HASURA_GRAPHQL_ADMIN_SECRET=${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-      - HASURA_GRAPHQL_ENDPOINT=http://graphql-engine-test:8080/v1/graphql
-      - POSTGRES_HOST=postgres_test
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=postgres
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${TEST_POSTGRES_PASSWORD:-postgrespassword}
-      - USE_MOCK_DATA=true
-      # The x402 Karate suite exercises the enabled payment gate. Settlement is
-      # still disabled so tests never call a facilitator /settle endpoint.
-      - X402_ENABLED=true
-      - X402_SETTLE_ENABLED=false
-      - SAFETRUST_PLATFORM_WALLET=${TEST_PLATFORM_WALLET:-GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57}
-      - X402_FACILITATOR_URL=https://channels.openzeppelin.com/x402/testnet
-      - STELLAR_NETWORK=testnet
+      PORT: "3000"
+      DATABASE_URL: "postgresql://${WEBHOOK_DB_USER:-webhook}:${WEBHOOK_DB_PASSWORD:?Set WEBHOOK_DB_PASSWORD or provide it via WEBHOOK_DB_PASSWORD_FILE}@postgres-test:5432/${POSTGRES_DB:-safetrust}"
+      HASURA_GRAPHQL_ADMIN_SECRET: "${HASURA_GRAPHQL_ADMIN_SECRET:?Set HASURA_GRAPHQL_ADMIN_SECRET or provide it via HASURA_GRAPHQL_ADMIN_SECRET_FILE}"
+      TRUSTLESSWORK_API_KEY: "${TRUSTLESSWORK_API_KEY:-}"
+      TRUSTLESSWORK_WEBHOOK_SECRET: "${TRUSTLESSWORK_WEBHOOK_SECRET:-}"
+      FIREBASE_PRIVATE_KEY: "${FIREBASE_PRIVATE_KEY:-}"
+      IS_TEST: "true"
+    secrets:
+      - POSTGRES_PASSWORD
+      - HASURA_GRAPHQL_ADMIN_SECRET
+      - TRUSTLESSWORK_API_KEY
+      - TRUSTLESSWORK_WEBHOOK_SECRET
+      - FIREBASE_PRIVATE_KEY
     depends_on:
-      postgres_test:
+      postgres-test:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/health/live"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
+      hasura-test:
+        condition: service_started
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/dist
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 100
     networks:
-      - test-network
+      - internal
 
-
-  karate:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
-    environment:
-      baseUrl: http://graphql-engine-test:8080/v1/graphql
-      webhookUrl: http://webhook:3001
-      HASURA_ADMIN_SECRET: ${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-      HASURA_GRAPHQL_ADMIN_SECRET: ${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-      JWT_SECRET: ${TEST_JWT_SECRET:-testsecret}
-    command: >
-      java -cp /app/tests/karate.jar:/app/tests/postgresql-jdbc.jar:/app/tests/karate/src/test/resources
-      com.intuit.karate.Main
-      --configdir /app/tests/karate/src/test/resources
-      --tags ~@ignore --tags ~@timing
-      tests/karate/features
-    volumes:
-      - ./tests/results:/app/target/karate-reports
-      - ./tests/results:/app/tests/results
-    depends_on:
-      postgres_test:
-        condition: service_healthy
-      webhook:
-        condition: service_healthy
-      migrate-test:
-        condition: service_completed_successfully
-      graphql-engine-test:
-        condition: service_healthy
-    networks:
-      - test-network
-
-  migrate-test:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      HASURA_GRAPHQL_ENDPOINT: http://graphql-engine-test:8080
-      HASURA_ADMIN_SECRET: ${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-      HASURA_GRAPHQL_ADMIN_SECRET: ${TEST_ADMIN_SECRET:?Set TEST_ADMIN_SECRET or run bin/test}
-    working_dir: /app
-    command: ["bash", "bin/prepare-test-db"]
-    depends_on:
-      graphql-engine-test:
-        condition: service_healthy
-    networks:
-      - test-network
-
-volumes:
-  db_data_test:
+secrets:
+  POSTGRES_PASSWORD:
+    environment: POSTGRES_PASSWORD
+  HASURA_GRAPHQL_ADMIN_SECRET:
+    environment: HASURA_GRAPHQL_ADMIN_SECRET
+  TRUSTLESSWORK_API_KEY:
+    environment: TRUSTLESSWORK_API_KEY
+  TRUSTLESSWORK_WEBHOOK_SECRET:
+    environment: TRUSTLESSWORK_WEBHOOK_SECRET
+  FIREBASE_PRIVATE_KEY:
+    environment: FIREBASE_PRIVATE_KEY
 
 networks:
-  test-network:
+  internal:
     driver: bridge
